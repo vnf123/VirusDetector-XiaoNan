@@ -7,6 +7,12 @@ const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta
 const navigationGuard = readFileSync(new URL('../content/navigation-guard.js', import.meta.url), 'utf8');
 const contentScript = readFileSync(new URL('../content/content-script.js', import.meta.url), 'utf8');
 const serviceWorker = readFileSync(new URL('../background/service-worker.js', import.meta.url), 'utf8');
+const siteAccessManager = readFileSync(new URL('../background/site-access-manager.js', import.meta.url), 'utf8');
+const warningHtml = readFileSync(new URL('../warning/warning.html', import.meta.url), 'utf8');
+const warningCss = readFileSync(new URL('../warning/warning.css', import.meta.url), 'utf8');
+const warningScript = readFileSync(new URL('../warning/warning.js', import.meta.url), 'utf8');
+const reportScript = readFileSync(new URL('../warning/report.js', import.meta.url), 'utf8');
+const themeInitScript = readFileSync(new URL('../popup/theme-init.js', import.meta.url), 'utf8');
 
 function sourceBetween(source, startMarker, endMarker) {
   const start = source.indexOf(startMarker);
@@ -148,6 +154,201 @@ test('adding a site to the whitelist removes an existing page blocker', () => {
     'case MSG_TYPES.ADD_TO_WHITELIST:',
     'case MSG_TYPES.REMOVE_FROM_WHITELIST:'
   );
+  const tabSync = sourceBetween(
+    serviceWorker,
+    'async function markTabWhitelisted',
+    'async function recheckTabAfterWhitelistRemoval'
+  );
 
-  assert.match(handler, /removeDownloadBlocker\s*\(/);
+  assert.match(handler, /whitelistSite\(url, tabs\[0\]\.id\)/);
+  assert.match(tabSync, /removeDownloadBlocker\(tabId\)/);
+});
+
+test('known threats are checked before navigation without inventing page evidence', () => {
+  const preflight = sourceBetween(
+    serviceWorker,
+    'async function runNavigationPreflight',
+    'chrome.webNavigation.onBeforeNavigate.addListener'
+  );
+
+  assert.match(serviceWorker, /chrome\.webNavigation\.onBeforeNavigate\.addListener/);
+  assert.match(preflight, /isWhitelisted\s*\(/);
+  assert.match(preflight, /SiteAccessManager\.isBlacklisted\s*\(/);
+  assert.match(preflight, /CacheManager\.get\s*\(/);
+  assert.match(preflight, /cached\s*&&\s*cached\.isMalicious/);
+  assert.match(preflight, /navigation\.committed/);
+  assert.match(preflight, /openWarningPage\(tabId,\s*tabState,\s*stage\)/);
+  assert.match(preflight, /isCurrentNavigation/);
+  assert.doesNotMatch(preflight, /ScoringEngine\.evaluate/);
+});
+
+test('high-risk responses replace the dangerous tab with the warning page', () => {
+  const warningFlow = sourceBetween(
+    serviceWorker,
+    'async function triggerWarningFlow',
+    'async function injectDownloadBlocker'
+  );
+  const warningPage = sourceBetween(
+    serviceWorker,
+    'async function openWarningPage',
+    '// ==================== 页面分析 ===================='
+  );
+
+  assert.match(warningFlow, /openWarningPage\(tabId,\s*tabState,\s*['"]postload['"]\)/);
+  assert.match(warningPage, /chrome\.tabs\.update\(tabId,\s*\{\s*url:\s*warningUrl/);
+  assert.match(warningPage, /originalUrl/);
+  assert.match(warningPage, /nonce:\s*createBlockedNonce\(\)/);
+  assert.match(warningPage, /safeUrl/);
+});
+
+test('the warning page exposes only safe primary actions and confirms trust', () => {
+  assert.match(warningHtml, /id="btn-back"[^>]*>回退<\/button>/);
+  assert.match(warningHtml, /id="btn-ask-ai"/);
+  assert.match(warningHtml, /你确认信任它吗？/);
+  assert.match(warningHtml, /是的，我信任它/);
+  assert.match(warningHtml, /不，我反悔了/);
+  assert.doesNotMatch(warningHtml, /id="risk-score"|威胁评分/);
+  assert.doesNotMatch(warningHtml, /关闭此页面|安全建议|此检测有误/);
+
+  assert.match(warningScript, /https:\/\/www\.doubao\.com\/chat\/\?q=/);
+  assert.match(warningScript, /type:\s*['"]TRUST_BLOCKED_SITE['"]/);
+  assert.match(warningScript, /payload:\s*\{\s*nonce\s*\}/);
+  assert.match(warningScript, /type:\s*['"]RETURN_TO_SAFETY['"]/);
+  assert.doesNotMatch(warningScript, /window\.history\.go/);
+});
+
+test('blocked actions require a trusted extension context', () => {
+  const trustHandler = sourceBetween(
+    serviceWorker,
+    'case MSG_TYPES.TRUST_BLOCKED_SITE:',
+    'case MSG_TYPES.RETURN_TO_SAFETY:'
+  );
+  const warningResources = (manifest.web_accessible_resources || [])
+    .flatMap(entry => entry.resources || []);
+
+  assert.equal(warningResources.includes('warning/warning.html'), false);
+  assert.match(trustHandler, /requireBlockedContext/);
+  assert.match(trustHandler, /message\.payload\?\.nonce/);
+  assert.doesNotMatch(trustHandler, /message\.payload\?\.url/);
+});
+
+test('stale analysis cannot replace a newer navigation', () => {
+  const warningFlow = sourceBetween(
+    serviceWorker,
+    'async function triggerWarningFlow',
+    'async function injectDownloadBlocker'
+  );
+
+  assert.match(warningFlow, /isCurrentAnalysisTarget/);
+  assert.match(serviceWorker, /_navigationGenerations/);
+  assert.match(serviceWorker, /sender\.tab\.url !== url/);
+  assert.match(serviceWorker, /analysisDocumentId/);
+  assert.match(serviceWorker, /isCurrentAnalysisIdentity/);
+  assert.match(serviceWorker, /tabStateMatchesAnalysisIdentity/);
+});
+
+test('async Whois and ICP results are bound to one document', () => {
+  const whoisUpdate = sourceBetween(
+    serviceWorker,
+    'async function _applyWhoisUpdate',
+    '// ==================== ICP 异步核验 ===================='
+  );
+  const icpUpdate = sourceBetween(
+    serviceWorker,
+    'async function _applyIcpUpdate',
+    'async function _postReportToWorker'
+  );
+
+  assert.match(serviceWorker, /navigationGeneration:\s*tabState\.navigationGeneration/);
+  assert.match(serviceWorker, /analysisDocumentId:\s*tabState\.analysisDocumentId/);
+  assert.match(whoisUpdate, /isCurrentAnalysisIdentity\(tabId,\s*ctx\)/);
+  assert.match(whoisUpdate, /tabStateMatchesAnalysisIdentity\(tabState,\s*ctx\)/);
+  assert.match(icpUpdate, /isCurrentAnalysisIdentity\(tabId,\s*snapshot\)/);
+  assert.match(icpUpdate, /tabStateMatchesAnalysisIdentity\(tabState,\s*snapshot\)/);
+  assert.match(whoisUpdate, /saveAnalysisStateIfCurrent/);
+  assert.match(whoisUpdate, /cacheAnalysisIfCurrent/);
+  assert.match(icpUpdate, /saveAnalysisStateIfCurrent/);
+  assert.match(icpUpdate, /cacheAnalysisIfCurrent/);
+});
+
+test('redirects and same-document navigation keep the current document identity', () => {
+  assert.match(serviceWorker, /navigation\.url\s*=\s*details\.url/);
+  assert.match(serviceWorker, /onHistoryStateUpdated\.addListener/);
+  assert.match(serviceWorker, /onReferenceFragmentUpdated\.addListener/);
+  assert.match(serviceWorker, /handleSameDocumentNavigation/);
+});
+
+test('warning state and reports use the backend blocked context', () => {
+  assert.match(serviceWorker, /isWarningPageUrl\(url\) \|\| isReportPageUrl\(url\)\) return/);
+  assert.match(serviceWorker, /case MSG_TYPES\.OPEN_BLOCKED_REPORT/);
+  assert.match(serviceWorker, /requireBlockedContext\([\s\S]*REPORT_PAGE_URL/);
+  assert.match(reportScript, /payload:\s*\{\s*reportType:\s*['"]false_positive['"],\s*nonce/);
+  assert.match(reportScript, /if \(!response\?\.success\)/);
+});
+
+test('site blacklist changes reconcile every open tab', () => {
+  assert.match(serviceWorker, /function syncSiteAccessStateAcrossTabs/);
+  assert.match(serviceWorker, /applyBlacklistToTab/);
+  assert.match(serviceWorker, /releaseBlacklistFromTab/);
+  assert.match(serviceWorker, /changes\[STORAGE_KEYS\.WHITELIST\] \|\| changes\[STORAGE_KEYS\.SITE_BLACKLIST\]/);
+});
+
+test('whitelist removal uses only the serialized cross-tab reconciliation queue', () => {
+  const handler = sourceBetween(
+    serviceWorker,
+    'case MSG_TYPES.REMOVE_FROM_WHITELIST:',
+    'case MSG_TYPES.CHECK_WHITELIST:'
+  );
+
+  assert.match(handler, /syncSiteAccessStateAcrossTabs\(\)/);
+  assert.doesNotMatch(handler, /recheckTabAfterWhitelistRemoval/);
+  assert.match(serviceWorker, /url:\s*tabState\.url/);
+  assert.match(serviceWorker, /tabStateMatchesAnalysisIdentity\(tabState,\s*backup\)/);
+});
+
+test('blocked reports fall back to a normal tab when popup creation fails', () => {
+  const handler = sourceBetween(
+    serviceWorker,
+    'case MSG_TYPES.OPEN_BLOCKED_REPORT:',
+    '// 下载二次确认'
+  );
+
+  assert.match(handler, /try\s*\{[\s\S]*chrome\.windows\.create/);
+  assert.match(handler, /catch\s*\{[\s\S]*chrome\.tabs\.create/);
+});
+
+test('the warning page inherits light, dark, and automatic extension themes', () => {
+  assert.match(warningHtml, /<script src="\.\.\/popup\/theme-init\.js"><\/script>/);
+  assert.match(warningHtml, /<html[^>]+style="display: none;"/);
+  assert.match(warningCss, /\[data-theme="light"\]/);
+  assert.match(warningCss, /\[data-theme="dark"\]/);
+  assert.match(themeInitScript, /localStorage\.getItem\(['"]vt_theme['"]\)/);
+  assert.match(warningScript, /chrome\.storage\.local\.get\(['"]global_settings['"]\)/);
+  assert.match(warningScript, /chrome\.storage\.onChanged\.addListener/);
+  assert.match(warningScript, /selectedTheme === ['"]auto['"]/);
+  assert.match(warningScript, /prefers-color-scheme:\s*dark/);
+});
+
+test('AI handoff shares only the blocked site origin', () => {
+  const shareableUrl = sourceBetween(
+    warningScript,
+    'function getShareableUrl',
+    'const params = new URLSearchParams'
+  );
+
+  assert.match(shareableUrl, /return parsed\.origin/);
+  assert.doesNotMatch(shareableUrl, /parsed\.href/);
+  assert.match(warningScript, /https:\/\/www\.doubao\.com\/chat\/\?q=/);
+});
+
+test('all site access changes go through one manager', () => {
+  assert.match(serviceWorker, /import \{ SiteAccessManager \} from ['"]\.\/site-access-manager\.js['"]/);
+  assert.match(siteAccessManager, /class SiteAccessManager/);
+  assert.match(siteAccessManager, /addToWhitelist/);
+  assert.match(siteAccessManager, /addToBlacklist/);
+  assert.match(siteAccessManager, /replaceWhitelist/);
+  assert.match(siteAccessManager, /_mutations/);
+  assert.doesNotMatch(serviceWorker, /import \{ SiteBlacklist \}/);
+  assert.match(warningScript, /changes\.whitelist/);
+  assert.match(warningScript, /CHECK_WHITELIST/);
 });
